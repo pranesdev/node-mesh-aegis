@@ -2,28 +2,50 @@
 //  mesh_node.ino  —  Predictive Self-Healing Maritime Mesh  (single-file)
 //
 //  One file, one upload. All tunables, packet struct, PMA* routing,
-//  scheduler, anomaly, buffer, telemetry, role election — everything
-//  baked in. Compiles in Arduino IDE with ESP32 board package.
+//  scheduler, anomaly, buffer, telemetry, WiFi uplink — everything
+//  baked in. Compiles in Arduino IDE with the ESP32 board package.
 //
-//  Set MY_ID per board before flashing. Set GATEWAY_ID to the node wired
-//  to the laptop (default 0).
+//  AUTO-ROLE FROM MAC (no #define per board):
+//    - The board whose MAC last byte == GATEWAY_MAC_BYTE becomes the gateway.
+//      It connects to WiFi and POSTs aggregated telemetry to the backend.
+//    - All other boards are mesh sensors/relays (ESP-NOW only, no WiFi).
+//    - Mesh nodes auto-assign their node ID = MAC last byte (1..254).
+//
+//  FLASH THE SAME .ino TO ALL BOARDS. Pick one board to be the gateway by
+//  setting GATEWAY_MAC_BYTE below to its MAC's last byte (read from Serial
+//  Monitor at first boot).
 // =============================================================================
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <LittleFS.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// =============================================================================
+//  0. COMPILE-TIME CONFIG — edit before flashing
+// =============================================================================
+
+// ---- WiFi (gateway only) ---------------------------------------------------
+// PLACE YOUR WIFI CREDENTIALS HERE BEFORE FLASHING.
+#define WIFI_SSID       "YOUR_WIFI_SSID"
+#define WIFI_PASS       "YOUR_WIFI_PASSWORD"
+
+// ---- Backend (gateway only) ------------------------------------------------
+// Render URL. The gateway POSTs NDJSON to {BASE}/ingest every 1 s.
+#define BACKEND_BASE    "https://node-mesh-aegis-2.onrender.com"
+#define BACKEND_INGEST  BACKEND_BASE "/ingest"
+
+// ---- Gateway identity ------------------------------------------------------
+// Set this to the LAST BYTE of the MAC of the board you want to act as gateway.
+// To find it: flash once with the Serial line that prints "mac=...", then
+// re-flash with the matching byte below.
+#define GATEWAY_MAC_BYTE  0x00
 
 // =============================================================================
 //  1. BOARD PINS  (ESP32-WROOM-32 DevKit v1)
 // =============================================================================
-//   GPIO 32  →  Sensor 0 analog  (e.g. NTC thermistor voltage divider)
-//   GPIO 33  →  Sensor 1 analog  (e.g. photoresistor / moisture)
-//   GPIO 34  →  Battery voltage  (INPUT_ONLY, 1/2 divider on LiPo)
-//   GPIO 25  →  Status LED (green, optional)
-//   GPIO 26  →  Alert LED  (red,   optional, lit on anomaly)
-//   GPIO  0  →  Boot button (built-in, used to force role = GW on hold)
-//   GPIO  2  →  On-board LED (active LOW on most DevKits)
 #define PIN_SENSOR_0          32
 #define PIN_SENSOR_1          33
 #define PIN_BATTERY_ADC       34
@@ -31,15 +53,9 @@
 #define PIN_LED_ALERT         26
 #define PIN_BTN_BOOT           0
 
-// ESP-NOW uses the on-board antenna — no extra wiring.
-
 // =============================================================================
-//  2. NODE IDENTITY  (edit per board, or set at compile time)
+//  2. TUNABLES
 // =============================================================================
-#define GATEWAY_ID                0      // demo-pinned gateway (USB-attached)
-#ifndef MY_ID
-#define MY_ID                     0      // OVERRIDE per board (0..4)
-#endif
 #define MAX_NEIGHBORS             8
 #define DEDUP_CACHE_SIZE         64
 
@@ -74,8 +90,13 @@
 #define BUFFER_FILE          "/buf"
 #define BUFFER_MAX_ATTEMPTS     6
 
+// Gateway uplink
+#define UPLINK_INTERVAL_MS   1000
+#define UPLINK_RING_SIZE       20
+#define UPLINK_HTTP_TIMEOUT  4000
+
 // =============================================================================
-//  2. PROTOCOL
+//  3. PROTOCOL
 // =============================================================================
 enum msg_type : uint8_t {
     HELLO         = 0x01,
@@ -121,23 +142,22 @@ typedef struct {
 } neighbor_t;
 
 // =============================================================================
-//  3. GLOBAL STATE
+//  4. GLOBAL STATE
 // =============================================================================
 static const uint8_t BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-const uint8_t  my_id            = MY_ID;
+uint8_t        my_id            = 0;       // resolved at boot from MAC
 uint8_t        my_role          = ROLE_SENSOR;
+bool           is_gateway       = false;   // resolved at boot
 uint8_t        my_battery       = 90;
 uint8_t        current_next_hop = 0xFF;
-uint8_t        route_mode       = 0;   // 0=RSSI, 1=ETX
+uint8_t        route_mode       = 0;       // 0=RSSI, 1=ETX
 RTC_DATA_ATTR uint32_t seq_counter = 0;
 
 neighbor_t neighbors[MAX_NEIGHBORS];
 uint8_t    n_neighbors = 0;
 
 QueueHandle_t inbox_q;
-
-// 3 priority queues
 QueueHandle_t q_crit, q_rel, q_be;
 
 struct dedup_entry { uint32_t key; bool used; };
@@ -152,8 +172,15 @@ struct anomaly_state {
 };
 static anomaly_state anomaly_s0, anomaly_s1;
 
+// ---- Gateway uplink ring buffer -------------------------------------------
+// Each slot holds one NDJSON payload (one record per known node).
+static char uplink_ring[UPLINK_RING_SIZE][768];
+static uint8_t uplink_head = 0;    // next slot to write
+static uint8_t uplink_count = 0;   // how many slots are populated
+static bool   uplink_pending[UPLINK_RING_SIZE] = {false};
+
 // =============================================================================
-//  4. HELPERS
+//  5. HELPERS
 // =============================================================================
 static inline float clamp01(float v) {
     return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
@@ -190,7 +217,7 @@ static bool dedup_seen(uint32_t key) {
 }
 
 // =============================================================================
-//  5. NEIGHBOUR / PREDICTOR
+//  6. NEIGHBOUR / PREDICTOR
 // =============================================================================
 static void add_peer(const uint8_t *mac) {
     esp_now_peer_info_t pi = {};
@@ -262,11 +289,9 @@ static void compute_costs_and_risk() {
         if (nb.ewma_etx > 2.0f) nb.risk = 1;
         if (nb.battery < BATTERY_LOW_THRESH) nb.risk = 1;
     }
-    // ageing
     uint32_t now = millis();
     for (int i = (int)n_neighbors - 1; i >= 0; --i) {
         if (now - neighbors[i].last_seen_ms > HELLO_DEAD_MS) {
-            // remove
             for (uint8_t j = i; j + 1 < n_neighbors; ++j) neighbors[j] = neighbors[j+1];
             n_neighbors--;
         }
@@ -284,7 +309,7 @@ static float edge_cost(const neighbor_t &nb) {
 }
 
 // =============================================================================
-//  6. PMA*  (Predictive Maritime A*)
+//  7. PMA*  (Predictive Maritime A*)
 // =============================================================================
 struct a_node { uint8_t id; float g, f; uint8_t parent; bool opened, closed; };
 
@@ -332,16 +357,13 @@ static uint8_t pma_next_hop(uint8_t src) {
     while (olen) {
         uint8_t ci = pop();
         a_node &c = nodes[ci];
-        if (c.id == GATEWAY_ID) {
-            uint8_t hop = c.parent;
-            while (hop != src && hop != 0xFF) {
-                int8_t pi = idx_of(hop);
-                if (pi < 0) break;
-                uint8_t p = nodes[pi].parent;
-                if (p == src) break;
-                hop = p;
-            }
-            return (hop == src) ? GATEWAY_ID : hop;
+        if (c.id == my_id && is_gateway) {
+            // gateway reached itself; the gateway is the destination
+            return 0xFF;
+        }
+        if (is_gateway && c.id == my_id) return 0xFF;
+        if (!is_gateway && c.id == 0xFF) {
+            // unreachable; this branch won't trigger in practice — we route to gateway by MAC
         }
         if (c.closed) continue;
         c.closed = true;
@@ -362,8 +384,14 @@ static uint8_t pma_next_hop(uint8_t src) {
     return 0xFF;
 }
 
+// Gateway is the destination for mesh nodes; pick the first neighbor that
+// matches a known gateway by id (set below) or — simpler — flood upward.
+// We treat the gateway as "any neighbor with role == ROLE_GW" or with the
+// preconfigured gateway id broadcast via HELLO.role.
+static uint8_t gateway_id_cache = 0xFF;
+
 // =============================================================================
-//  7. ANOMALY  (Welford online)
+//  8. ANOMALY  (Welford online)
 // =============================================================================
 static uint8_t anomaly_push(anomaly_state &s, int x) {
     s.n++;
@@ -375,28 +403,33 @@ static uint8_t anomaly_push(anomaly_state &s, int x) {
     float sd = sqrtf(s.var / s.n);
     if (sd < 0.001f) sd = 0.001f;
     uint8_t flag = 0;
-    if (fabsf(x - s.mean) > ANOM_Z_THRESH * sd) flag = 1;            // spike
-    else if (fabsf(x - s.prev) > ANOM_JUMP_THRESH * sd) flag = 2;     // jump
+    if (fabsf(x - s.mean) > ANOM_Z_THRESH * sd) flag = 1;
+    else if (fabsf(x - s.prev) > ANOM_JUMP_THRESH * sd) flag = 2;
     s.prev = x;
     s.last_flag = flag;
     return flag;
 }
 
 // =============================================================================
-//  8. RADIO
+//  9. RADIO
 // =============================================================================
 static void onDataSent(const uint8_t *, esp_now_send_status_t) {}
 static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
     if (len < (int)sizeof(mesh_pkt_t)) return;
     mesh_pkt_t p; memcpy(&p, data, sizeof(p));
     if (p.crc != crc16(data, sizeof(p) - 2)) return;
-    if (p.type == HELLO) { neighbor_update(p, mac); return; }
+    if (p.type == HELLO) {
+        const hello_payload_t *hp = (const hello_payload_t *)p.payload;
+        if (hp->role == ROLE_GW) gateway_id_cache = p.src;
+        neighbor_update(p, mac);
+        return;
+    }
     QueueHandle_t q;
     if (p.prio == CRITICAL)      q = q_crit;
     else if (p.prio == RELIABLE) q = q_rel;
     else                         q = q_be;
-    BaseType_t hp = pdFALSE;
-    xQueueSendFromISR(q, &p, &hp);
+    BaseType_t hp2 = pdFALSE;
+    xQueueSendFromISR(q, &p, &hp2);
 }
 
 static void radio_init() {
@@ -411,7 +444,7 @@ static void radio_init() {
 }
 
 // =============================================================================
-//  9. FORWARDING + BUFFER + ACK
+//  10. FORWARDING + BUFFER + ACK
 // =============================================================================
 static void send_unicast(uint8_t next_id, const mesh_pkt_t &p) {
     for (uint8_t i = 0; i < n_neighbors; ++i)
@@ -443,7 +476,20 @@ static void process_queue(QueueHandle_t q, prio /*p*/) {
             }
             continue;
         }
-        uint8_t nh = pma_next_hop(my_id);
+        // Pick next hop: gateway routes nowhere; sensor/relay picks toward gateway.
+        uint8_t nh;
+        if (is_gateway) {
+            nh = 0xFF;
+        } else if (gateway_id_cache != 0xFF) {
+            // direct A* with gateway as destination (cheap shortcut: nearest neighbor to gateway)
+            // For simplicity, if any neighbor is the gateway, pick that one.
+            for (uint8_t i = 0; i < n_neighbors; ++i)
+                if (neighbors[i].id == gateway_id_cache) { nh = neighbors[i].id; break; }
+            if (nh == 0xFF) nh = pma_next_hop(my_id);
+        } else {
+            nh = pma_next_hop(my_id);
+        }
+
         if (nh == 0xFF) {
             File f = LittleFS.open(BUFFER_FILE, "a");
             if (f) { f.write((uint8_t*)&p, sizeof(p)); f.close(); }
@@ -461,7 +507,16 @@ static void drain_buffer() {
     bool any = false;
     while ((int)f.available() >= (int)sizeof(p)) {
         f.readBytes((char*)&p, sizeof(p));
-        uint8_t nh = pma_next_hop(my_id);
+        uint8_t nh;
+        if (is_gateway) nh = 0xFF;
+        else if (gateway_id_cache != 0xFF) {
+            nh = 0xFF;
+            for (uint8_t i = 0; i < n_neighbors; ++i)
+                if (neighbors[i].id == gateway_id_cache) { nh = neighbors[i].id; break; }
+            if (nh == 0xFF) nh = pma_next_hop(my_id);
+        } else {
+            nh = pma_next_hop(my_id);
+        }
         if (nh == 0xFF) { any = true; break; }
         send_unicast(nh, p);
         any = true;
@@ -471,7 +526,7 @@ static void drain_buffer() {
 }
 
 // =============================================================================
-//  10. SCHEDULER TICKS
+//  11. SCHEDULER TICKS
 // =============================================================================
 static void tick_heartbeat() {
     mesh_pkt_t p = {};
@@ -495,7 +550,6 @@ static void tick_anomaly() {
     uint8_t f0 = anomaly_push(anomaly_s0, a0);
     uint8_t f1 = anomaly_push(anomaly_s1, a1);
 
-    // LED feedback: green while clean, red blink on anomaly
     static uint32_t last_led = 0;
     if (f0 || f1) {
         if (millis() - last_led > 120) {
@@ -511,18 +565,44 @@ static void tick_anomaly() {
     if (f0 || f1) {
         mesh_pkt_t p = {};
         p.type = ANOM; p.ver = 1; p.prio = RELIABLE;
-        p.src = my_id; p.dst = GATEWAY_ID;
+        p.src = my_id; p.dst = 0xFF;     // broadcast to gateway via neighbors
         p.seq = ++seq_counter;
         p.payload[0] = my_id;
         p.payload[1] = f0;
         p.payload[2] = f1;
         p.crc = crc16((uint8_t*)&p, sizeof(p) - 2);
-        send_unicast(pma_next_hop(my_id), p);
+        uint8_t nh = 0xFF;
+        if (gateway_id_cache != 0xFF) {
+            for (uint8_t i = 0; i < n_neighbors; ++i)
+                if (neighbors[i].id == gateway_id_cache) { nh = neighbors[i].id; break; }
+        }
+        if (nh == 0xFF) nh = pma_next_hop(my_id);
+        if (nh != 0xFF) send_unicast(nh, p);
     }
 }
 
+// Build a JSON record for one node (gateway uses this for uplink).
+static void node_json(uint8_t id, uint8_t role, uint8_t bat, int8_t rssi_self, char *out, size_t outlen) {
+    StaticJsonDocument<512> doc;
+    doc["node"]   = id;
+    doc["role"]   = role;
+    doc["rssi"]   = rssi_self;
+    doc["bat"]    = bat;
+    JsonArray nbrs = doc.createNestedArray("nbrs");
+    for (uint8_t i = 0; i < n_neighbors; ++i) {
+        JsonObject o = nbrs.createNestedObject();
+        o["id"]   = neighbors[i].id;
+        o["rssi"] = neighbors[i].rssi;
+        o["etx"]  = (uint8_t)(neighbors[i].ewma_etx * 10);
+        o["bat"]  = neighbors[i].battery;
+        o["risk"] = neighbors[i].risk;
+        o["hop"]  = neighbors[i].hop_count;
+    }
+    serializeJson(doc, out, outlen);
+}
+
 static void tick_telemetry() {
-    // build JSON
+    // Local Serial dump (unchanged behavior).
     Serial.print(F("{\"id\":")); Serial.print(my_id);
     Serial.print(F(",\"role\":")); Serial.print(my_role);
     Serial.print(F(",\"bat\":")); Serial.print(my_battery);
@@ -539,78 +619,189 @@ static void tick_telemetry() {
             neighbors[i].hop_count);
     }
     Serial.print(F("]}\n"));
+
+    // Gateway: build NDJSON uplink payload (one record per known mesh node).
+    if (is_gateway) {
+        StaticJsonDocument<1024> doc;
+        JsonArray arr = doc.to<JsonArray>();
+        // First record: the gateway itself.
+        {
+            JsonObject o = arr.createNestedObject();
+            o["node"] = my_id;
+            o["role"] = my_role;
+            o["rssi"] = (int8_t)WiFi.RSSI();
+            o["bat"]  = my_battery;
+            JsonArray nb = o.createNestedArray("nbrs");
+            for (uint8_t i = 0; i < n_neighbors; ++i) {
+                JsonObject x = nb.createNestedObject();
+                x["id"]   = neighbors[i].id;
+                x["rssi"] = neighbors[i].rssi;
+                x["etx"]  = (uint8_t)(neighbors[i].ewma_etx * 10);
+                x["bat"]  = neighbors[i].battery;
+                x["risk"] = neighbors[i].risk;
+                x["hop"]  = neighbors[i].hop_count;
+            }
+        }
+        // Then one record per neighbor that has battery info (mesh nodes).
+        for (uint8_t i = 0; i < n_neighbors; ++i) {
+            JsonObject o = arr.createNestedObject();
+            o["node"] = neighbors[i].id;
+            o["role"] = (neighbors[i].risk ? ROLE_SENSOR : ROLE_RELAY);
+            o["rssi"] = neighbors[i].rssi;
+            o["bat"]  = neighbors[i].battery;
+            JsonArray nb = o.createNestedArray("nbrs");
+            // (Mesh nodes don't share their full neighbor table over the air,
+            //  so we report what the gateway knows about them.)
+        }
+        // Serialize NDJSON.
+        char buf[1024];
+        size_t off = 0;
+        for (JsonObject o : arr) {
+            size_t n = serializeJson(o, buf + off, sizeof(buf) - off - 2);
+            buf[off + n] = '\n';
+            off += n + 1;
+        }
+        buf[off] = '\0';
+        // Stage into ring buffer.
+        strncpy(uplink_ring[uplink_head], buf, sizeof(uplink_ring[0]) - 1);
+        uplink_ring[uplink_head][sizeof(uplink_ring[0]) - 1] = '\0';
+        uplink_pending[uplink_head] = true;
+        uplink_head = (uplink_head + 1) % UPLINK_RING_SIZE;
+        if (uplink_count < UPLINK_RING_SIZE) uplink_count++;
+    }
 }
 
 static void tick_role() {
-    if (my_id == GATEWAY_ID) { my_role = ROLE_GW; return; }
+    if (is_gateway) { my_role = ROLE_GW; return; }
     my_role = (n_neighbors >= 3) ? ROLE_RELAY : ROLE_SENSOR;
 }
 
 // =============================================================================
-//  11. SETUP / LOOP
+//  12. GATEWAY UPLINK (WiFi + HTTP POST)
+// =============================================================================
+static void wifi_connect() {
+    if (!is_gateway) return;
+    if (WiFi.status() == WL_CONNECTED) return;
+    Serial.printf("[wifi] connecting to %s ...\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+static void tick_uplink() {
+    if (!is_gateway) return;
+
+    if (WiFi.status() != WL_CONNECTED) {
+        wifi_connect();
+        return;
+    }
+
+    if (uplink_count == 0) return;
+
+    // Find oldest pending slot.
+    uint8_t slot = (uplink_head + UPLINK_RING_SIZE - uplink_count) % UPLINK_RING_SIZE;
+    if (!uplink_pending[slot]) {
+        // nothing pending in head window; advance
+        uplink_count--;
+        return;
+    }
+
+    HTTPClient http;
+    http.begin(BACKEND_INGEST);
+    http.setTimeout(UPLINK_HTTP_TIMEOUT);
+    http.addHeader("Content-Type", "application/x-ndjson");
+    int code = http.POST((uint8_t*)uplink_ring[slot], strlen(uplink_ring[slot]));
+    if (code > 0) {
+        Serial.printf("[uplink] %s -> %d\n", BACKEND_INGEST, code);
+        uplink_pending[slot] = false;
+        uplink_count--;
+    } else {
+        Serial.printf("[uplink] POST failed: %s (will retry)\n",
+                      HTTPClient::errorToString(code).c_str());
+    }
+    http.end();
+}
+
+// =============================================================================
+//  13. SETUP / LOOP
 // =============================================================================
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println(F("mesh_node booting…"));
+    Serial.println(F("mesh_node booting..."));
 
-    // ---- GPIO ----------------------------------------------------------
+    // ---- GPIO --------------------------------------------------------------
     pinMode(PIN_LED_OK,    OUTPUT);
     pinMode(PIN_LED_ALERT, OUTPUT);
     pinMode(PIN_BTN_BOOT,  INPUT_PULLUP);
-    analogReadResolution(12);  // 0..4095
-    digitalWrite(PIN_LED_OK, HIGH);  // start green
+    analogReadResolution(12);
+    digitalWrite(PIN_LED_OK, HIGH);
 
-    // ---- Battery read (averaged, 1/2 divider assumed → 2×) ----------
+    // ---- Resolve identity from MAC -----------------------------------------
+    uint8_t mac[6];
+    WiFi.macAddress(mac);   // works even before WiFi.begin()
+    uint8_t last_byte = mac[5];
+    is_gateway = (last_byte == GATEWAY_MAC_BYTE);
+    my_id = last_byte;
+    my_role = is_gateway ? ROLE_GW : ROLE_SENSOR;
+    Serial.printf("{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"id\":%u,\"role\":\"%s\"}\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                  my_id, is_gateway ? "GATEWAY" : "NODE");
+
+    // ---- Battery read (averaged, 1/2 divider assumed) -----------------------
     uint32_t sum = 0;
     for (int i = 0; i < 16; ++i) sum += analogRead(PIN_BATTERY_ADC);
-    float v = (float)(sum / 16) / 4095.0f * 3.3f * 2.0f;  // divider ×2
-    // map 3.0 V → 0 %, 4.2 V → 100 %
+    float v = (float)(sum / 16) / 4095.0f * 3.3f * 2.0f;
     int pct = (int)((v - 3.0f) / 1.2f * 100.0f);
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     my_battery = (uint8_t)pct;
 
-    // ---- Boot button held at reset → force this node to be the gateway
+    // ---- Boot button held at reset -> force this node to be the gateway ----
     if (digitalRead(PIN_BTN_BOOT) == LOW) {
-        Serial.println(F("boot button held → forcing GATEWAY_ID=MY_ID"));
-        Serial.printf("{\"boot_btn\":\"gateway-forced\",\"my_id\":%u}\n", MY_ID);
+        is_gateway = true;
+        my_role = ROLE_GW;
+        Serial.println(F("boot button held -> forcing gateway role"));
     }
 
-    // ---- FS, queues, radio --------------------------------------------
+    // ---- FS, queues, radio -------------------------------------------------
     if (!LittleFS.begin()) Serial.println(F("FS fail"));
     q_crit = xQueueCreate(16, sizeof(mesh_pkt_t));
     q_rel  = xQueueCreate(32, sizeof(mesh_pkt_t));
     q_be   = xQueueCreate(32, sizeof(mesh_pkt_t));
     radio_init();
-    my_role = (my_id == GATEWAY_ID) ? ROLE_GW : ROLE_SENSOR;
 
-    Serial.printf("{\"boot\":{\"id\":%u,\"role\":%u,\"bat\":%u,\"pin_s0\":%u,\"pin_s1\":%u}}\n",
-                  my_id, my_role, my_battery, PIN_SENSOR_0, PIN_SENSOR_1);
+    // Gateway: bring up WiFi asynchronously; loop() retries.
+    if (is_gateway) wifi_connect();
+
+    Serial.printf("{\"boot\":{\"id\":%u,\"role\":%u,\"bat\":%u,\"is_gw\":%s}}\n",
+                  my_id, my_role, my_battery, is_gateway ? "true" : "false");
 }
 
 uint32_t last_hb = 0, last_cost = 0, last_telem = 0,
-         last_anom = 0, last_role = 0, last_drain = 0;
+         last_anom = 0, last_role = 0, last_drain = 0,
+         last_uplink = 0;
 
 void loop() {
     uint32_t now = millis();
 
-    // drain priority queues (CRITICAL first, always)
     process_queue(q_crit, CRITICAL);
     process_queue(q_rel,  RELIABLE);
     process_queue(q_be,   BEST_EFFORT);
 
     if (now - last_hb    >= HELLO_INTERVAL_MS) { tick_heartbeat(); last_hb    = now; }
-    if (now - last_cost  >= 1000)              { compute_costs_and_risk();
-        // proactive reroute via PMA*; CRITICAL forces fresh search every packet
+    if (now - last_cost  >= 1000)              {
+        compute_costs_and_risk();
         uint8_t new_nh = pma_next_hop(my_id);
         if (new_nh != 0xFF && new_nh != current_next_hop) current_next_hop = new_nh;
-        last_cost = now; }
+        last_cost = now;
+    }
     if (now - last_anom  >= 100)               { tick_anomaly();   last_anom  = now; }
     if (now - last_drain >= 1000)              { drain_buffer();   last_drain = now; }
     if (now - last_role  >= 30000)             { tick_role();      last_role  = now; }
     if (now - last_telem >= 1000)              { tick_telemetry(); last_telem = now; }
+    if (now - last_uplink >= UPLINK_INTERVAL_MS && is_gateway) {
+        tick_uplink(); last_uplink = now;
+    }
 
-    // serial command: MODE:RSSI / MODE:ETX
     if (Serial.available()) {
         String s = Serial.readStringUntil('\n');
         s.trim();

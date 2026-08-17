@@ -12,7 +12,8 @@ const statsSubs = new Set<(s: typeof stats) => void>();
 function openSocket() {
   if (socket && socket.readyState <= WebSocket.OPEN) return;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-  const target = import.meta.env.VITE_WS_URL || 'wss://node-mesh-aegis.onrender.com/ws';
+  // Hard-coded production backend. Single source of truth for the dashboard.
+  const target = 'wss://node-mesh-aegis-2.onrender.com/ws';
   socket = new WebSocket(target);
   socket.onmessage = (ev) => {
     let m: any;
