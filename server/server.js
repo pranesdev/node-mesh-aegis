@@ -17,6 +17,16 @@ import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
+// CORS for the separately hosted frontend (Vercel/etc).
+// Allow-list is opt-in: FRONTEND_URL (single origin) plus comma-separated extras.
+const ALLOWED_ORIGINS = [
+  process.env.FRONTEND_URL,
+  ...(process.env.FRONTEND_URL_EXTRA || '').split(',').map(s => s.trim()).filter(Boolean),
+  // Local dev convenience — fine to leave in prod; harmless if unused.
+  'http://localhost:3000',
+  'http://localhost:5173',
+].filter(Boolean);
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
 
@@ -214,7 +224,37 @@ regen(state.nodeCount);
 
 // ===== HTTP + WS =====
 const app = express();
+
+// CORS — only allow the configured frontend origin(s). Browsers will preflight
+// OPTIONS automatically; we answer them here so the dashboard's XHR/WS handshake
+// works from a different host (e.g. vercel.app).
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Max-Age', '600');
+  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
 app.use(express.static(ROOT));  // serves /positions.json etc.
+
+// Health check for Render (and for the frontend to ping the backend).
+app.get('/api/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'aegis-mesh-backend',
+    uptime_s: Math.round(process.uptime()),
+    tick_ms: TICK_MS,
+    nodes: state.nodeCount,
+    clients: CLIENTS.size,
+    ts: Date.now(),
+  });
+});
 
 // ---- ESP32 ingest ---------------------------------------------------------
 // The gateway firmware batches one JSON record per second into a 5 s POST.
