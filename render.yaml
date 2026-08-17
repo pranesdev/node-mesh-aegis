@@ -10,16 +10,3 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-
-  - type: static
-    name: node-mesh-aegis-frontend
-    rootDir: .
-    buildCommand: npm --prefix web install --include=dev && (cd web && ./node_modules/.bin/tsc --noEmit) && node web/node_modules/vite/bin/vite.js build
-    staticPublishPath: web/dist
-    autoDeploy: true
-    rewrites:
-      - source: /*
-        destination: /index.html
-    envVars:
-      - key: VITE_WS_URL
-        value: wss://node-mesh-aegis.onrender.com/ws
