@@ -28,9 +28,9 @@
 // =============================================================================
 
 // ---- WiFi (gateway only) ---------------------------------------------------
-// PLACE YOUR WIFI CREDENTIALS HERE BEFORE FLASHING.
-#define WIFI_SSID       "YOUR_WIFI_SSID"
-#define WIFI_PASS       "YOUR_WIFI_PASSWORD"
+// Hard-coded for the OPPO K13 5G phone hotspot.
+#define WIFI_SSID       "OPPO K13 5G"
+#define WIFI_PASS       "12345678"
 
 // ---- Backend (gateway only) ------------------------------------------------
 // Render URL. The gateway POSTs NDJSON to {BASE}/ingest every 1 s.
