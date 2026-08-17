@@ -28,9 +28,9 @@
 // =============================================================================
 
 // ---- WiFi (gateway only) ---------------------------------------------------
-// Hard-coded for the OPPO K13 5G phone hotspot.
-#define WIFI_SSID       "OPPO K13 5G"
-#define WIFI_PASS       "12345678"
+// Hard-coded for the Galaxy A16 5G phone hotspot.
+#define WIFI_SSID       "Galaxy A16 5G 8337"
+#define WIFI_PASS       "2008sj2114"
 
 // ---- Backend (gateway only) ------------------------------------------------
 // Render URL. The gateway POSTs NDJSON to {BASE}/ingest every 1 s.
