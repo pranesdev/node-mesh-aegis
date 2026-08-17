@@ -683,18 +683,40 @@ static void tick_role() {
 // =============================================================================
 //  12. GATEWAY UPLINK (WiFi + HTTP POST)
 // =============================================================================
+// Guard against re-entrant WiFi.begin() calls. The driver errors out if
+// WiFi.mode()/WiFi.begin() is invoked while a connection attempt is in
+// flight, so we only start a connection once and let the driver retry.
+static bool wifi_connect_started = false;
+static uint32_t wifi_connect_started_ms = 0;
+static bool wifi_was_connected = false;
+
 static void wifi_connect() {
     if (!is_gateway) return;
     if (WiFi.status() == WL_CONNECTED) return;
+    if (wifi_connect_started) {
+        // Give the driver ~15 s before giving up and re-trying fresh.
+        if (millis() - wifi_connect_started_ms < 15000) return;
+        Serial.println(F("[wifi] giving up, restarting connection"));
+        WiFi.disconnect();
+        wifi_connect_started = false;
+    }
     Serial.printf("[wifi] connecting to %s ...\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
+    wifi_connect_started = true;
+    wifi_connect_started_ms = millis();
 }
 
 static void tick_uplink() {
     if (!is_gateway) return;
 
-    if (WiFi.status() != WL_CONNECTED) {
+    bool connected = (WiFi.status() == WL_CONNECTED);
+    if (connected && !wifi_was_connected) {
+        Serial.printf("[wifi] connected, IP %s\n",
+                      WiFi.localIP().toString().c_str());
+        wifi_was_connected = true;
+    } else if (!connected) {
+        wifi_was_connected = false;
         wifi_connect();
         return;
     }
