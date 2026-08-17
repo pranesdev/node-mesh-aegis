@@ -216,12 +216,39 @@ regen(state.nodeCount);
 const app = express();
 app.use(express.static(ROOT));  // serves /positions.json etc.
 
+// ---- ESP32 ingest ---------------------------------------------------------
+// The gateway firmware batches one JSON record per second into a 5 s POST.
+// Body can be a single JSON object OR newline-delimited JSON (NDJSON).
+// Each line is wrapped into a {cmd:'telemetry', line: <json>} envelope and
+// re-broadcast over WebSocket so the dashboard can overlay real-node data
+// on top of the simulator.
+app.use('/ingest', express.text({ type: '*/*', limit: '256kb' }));
+app.post('/ingest', (req, res) => {
+    const body = (req.body || '').toString();
+    let n = 0;
+    if (body.trim().startsWith('{')) {
+        // single record or NDJSON — split on newlines just in case
+        for (const line of body.split(/\r?\n/)) {
+            const t = line.trim();
+            if (!t.startsWith('{')) continue;
+            let rec;
+            try { rec = JSON.parse(t); } catch { continue; }      // drop malformed
+            // cache latest record per node so the next snapshot can merge it in
+            if (typeof rec.node === 'number') liveNodes[rec.node] = rec;
+            broadcast({ cmd: 'telemetry', line: t });
+            n++;
+        }
+    }
+    console.log(`[ingest] ${n} record(s) from ${req.ip}`);
+    res.status(200).json({ ok: true, count: n });
+});
+
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
 wss.on('connection', (ws) => {
   CLIENTS.add(ws);
-  try { ws.send(JSON.stringify(snapshot())); } catch {}
+  try { ws.send(JSON.stringify(withLive(snapshot()))); } catch {}
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -249,6 +276,37 @@ wss.on('connection', (ws) => {
   ws.on('close', () => CLIENTS.delete(ws));
 });
 
+// Live ESP32 records keyed by node id — populated by POST /ingest and
+// folded into the next broadcast by `withLive()`.
+const liveNodes = {};
+function withLive(snap) {
+    const ids = Object.keys(liveNodes);
+    if (!ids.length) return snap;
+    // convert live ESP32 records into the {nodes:[…]} shape the dashboard
+    // already understands.  Live records replace any simulator node with
+    // the same id, so a real gateway (id=0) overlays the simulated one.
+    const live = ids.map((k) => {
+        const r = liveNodes[k];
+        const id = +k;
+        return {
+            id,
+            role: r.role ?? 2,
+            battery: r.bat ?? 100,
+            anomaly: false,
+            route_mode: r.mode ?? 0,
+            rssi: r.rssi ?? -60,
+            neighbors: (r.nbrs || []).map((n) => ({
+                id: n.id, rssi: n.rssi, etx: Math.round((n.etx || 1) * 100),
+                battery: n.bat, risk: n.risk, hop: n.hop,
+            })),
+        };
+    });
+    // merge: live first, then any simulator nodes not in live
+    const liveIds = new Set(live.map((n) => n.id));
+    const simOnly = (snap.nodes || []).filter((n) => !liveIds.has(n.id));
+    return { ...snap, nodes: [...live, ...simOnly] };
+}
+
 function broadcast(obj) {
   const data = JSON.stringify(obj);
   for (const ws of CLIENTS) {
@@ -256,7 +314,7 @@ function broadcast(obj) {
   }
 }
 
-setInterval(() => broadcast(snapshot()), TICK_MS);
+setInterval(() => broadcast(withLive(snapshot())), TICK_MS);
 
 httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
   console.log(`[http] serving on http://localhost:${HTTP_PORT}`);

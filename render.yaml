@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: node-mesh-aegis
+    env: node
+    rootDir: server
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+  - type: static
+    name: node-mesh-aegis-frontend
+    rootDir: .
+    buildCommand: npm --prefix web install && npm --prefix web run build
+    staticPublishPath: public
+    autoDeploy: true
+    envVars:
+      - key: VITE_WS_URL
+        value: wss://node-mesh-aegis.onrender.com/ws

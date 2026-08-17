@@ -12,8 +12,8 @@ const statsSubs = new Set<(s: typeof stats) => void>();
 function openSocket() {
   if (socket && socket.readyState <= WebSocket.OPEN) return;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  socket = new WebSocket(`${proto}//${location.host}/ws`);
+  const target = import.meta.env.VITE_WS_URL || 'wss://node-mesh-aegis.onrender.com/ws';
+  socket = new WebSocket(target);
   socket.onmessage = (ev) => {
     let m: any;
     try { m = JSON.parse(ev.data); } catch { return; }
