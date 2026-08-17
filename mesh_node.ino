@@ -41,7 +41,8 @@
 // Set this to the LAST BYTE of the MAC of the board you want to act as gateway.
 // To find it: flash once with the Serial line that prints "mac=...", then
 // re-flash with the matching byte below.
-#define GATEWAY_MAC_BYTE  0x00
+// Current gateway board: MAC last byte 0x3F (= id 63).
+#define GATEWAY_MAC_BYTE  0x3F
 
 // =============================================================================
 //  1. BOARD PINS  (ESP32-WROOM-32 DevKit v1)
@@ -413,8 +414,11 @@ static uint8_t anomaly_push(anomaly_state &s, int x) {
 // =============================================================================
 //  9. RADIO
 // =============================================================================
-static void onDataSent(const uint8_t *, esp_now_send_status_t) {}
-static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
+// ESP32 3.x ESP-NOW API: callbacks receive info structs, not raw MAC pointers.
+static void onDataSent(const wifi_tx_info_t *, esp_now_send_status_t) {}
+static void onDataRecv(const esp_now_recv_info *recv_info, const uint8_t *data, int len) {
+    const uint8_t *mac = recv_info ? recv_info->src_addr : nullptr;
+    if (!mac) return;
     if (len < (int)sizeof(mesh_pkt_t)) return;
     mesh_pkt_t p; memcpy(&p, data, sizeof(p));
     if (p.crc != crc16(data, sizeof(p) - 2)) return;

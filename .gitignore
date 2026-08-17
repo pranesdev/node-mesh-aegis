@@ -43,3 +43,6 @@ Thumbs.db
 *.bin
 *.o
 *.obj
+# Arduino IDE auto-creates a project folder named after the sketch when you
+# first open mesh_node.ino. The canonical source lives at mesh_node.ino.
+mesh_node/
