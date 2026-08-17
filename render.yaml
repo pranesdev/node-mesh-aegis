@@ -14,7 +14,7 @@ services:
   - type: static
     name: node-mesh-aegis-frontend
     rootDir: .
-    buildCommand: rm -rf web/node_modules && npm --prefix web install && npm --prefix web run build
+    buildCommand: npm --prefix web install --include=dev && (cd web && ./node_modules/.bin/tsc --noEmit) && node web/node_modules/vite/bin/vite.js build
     staticPublishPath: web/dist
     autoDeploy: true
     rewrites:
