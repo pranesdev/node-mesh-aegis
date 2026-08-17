@@ -4,7 +4,7 @@ services:
     env: node
     rootDir: server
     plan: free
-    buildCommand: npm install
+    buildCommand: npm ci || npm install
     startCommand: npm start
     autoDeploy: true
     envVars:
@@ -14,9 +14,12 @@ services:
   - type: static
     name: node-mesh-aegis-frontend
     rootDir: .
-    buildCommand: npm --prefix web install && npm --prefix web run build
-    staticPublishPath: public
+    buildCommand: rm -rf web/node_modules && npm --prefix web install && npm --prefix web run build
+    staticPublishPath: web/dist
     autoDeploy: true
+    rewrites:
+      - source: /*
+        destination: /index.html
     envVars:
       - key: VITE_WS_URL
         value: wss://node-mesh-aegis.onrender.com/ws
